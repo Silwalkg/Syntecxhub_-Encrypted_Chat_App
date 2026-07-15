@@ -1,6 +1,6 @@
 # 🔒 Encrypted Chat App
 
-A client/server chat application where every message is encrypted with **AES-256-CBC** before it leaves the client. Keys are never hard-coded — each session negotiates a fresh key via **Diffie-Hellman** key exchange.
+A client/server chat application where every message is encrypted **and authenticated** with **AES-256-GCM** before it leaves the client. Keys are never hard-coded — each session negotiates a fresh key via **Diffie-Hellman** key exchange using the RFC 3526 Group 14 safe prime.
 
 ---
 
@@ -8,13 +8,14 @@ A client/server chat application where every message is encrypted with **AES-256
 
 | Feature | Details |
 |---|---|
-| Encryption | AES-256-CBC |
-| Key Exchange | Diffie-Hellman (2048-bit MODP) + HKDF-SHA256 key derivation |
-| IV handling | Fresh random 16-byte IV per message |
+| Encryption | AES-256-GCM (AEAD — confidentiality + integrity in one primitive) |
+| Message authentication | Built-in GCM auth tag — tampered ciphertext raises `InvalidTag`, never silently decrypts |
+| Key Exchange | Diffie-Hellman (RFC 3526 Group 14, 2048-bit) + HKDF-SHA256 key derivation |
+| Nonce handling | Fresh random 12-byte nonce per message (GCM standard) |
 | Transport | TCP with length-prefixed framing |
 | Concurrency | One thread per client (server-side) |
 | Logging | All messages logged to `chat.log` with timestamps |
-| UI | Colour terminal (works on Windows, macOS, Linux) |
+| UI | Colour terminal (Windows, macOS, Linux) |
 
 ---
 
@@ -24,7 +25,7 @@ A client/server chat application where every message is encrypted with **AES-256
 Encrypted Chat App/
 ├── server.py        ← Multi-client server
 ├── client.py        ← Terminal chat client
-├── crypto_utils.py  ← DH key exchange + AES-256-CBC helpers
+├── crypto_utils.py  ← DH key exchange + AES-256-GCM helpers
 ├── protocol.py      ← Length-prefixed TCP framing
 ├── requirements.txt
 └── README.md
@@ -56,7 +57,7 @@ python server.py
 #   --port  port number   (default: 9999)
 ```
 
-The server will generate DH parameters on startup (takes ~1–2 seconds), then listen for connections.
+The server loads RFC 3526 DH parameters instantly (no slow key generation) and begins listening.
 
 ### Start a client (open a new terminal per client)
 ```bash
@@ -88,20 +89,34 @@ Client A                          Server                         Client B
    │◀─ client A pubkey sent ────────│                                │
    │   [shared_key_A derived]       │   [shared_key_A derived]       │
    │                                │                                │
-   │══ AES-256-CBC(shared_key_A) ══▶│ decrypt → log → re-encrypt     │
-   │                                │══ AES-256-CBC(shared_key_B) ══▶│
+   │══ AES-256-GCM(shared_key_A) ══▶│ decrypt+verify → log           │
+   │                                │        → re-encrypt            │
+   │                                │══ AES-256-GCM(shared_key_B) ══▶│
 ```
 
-1. Server generates 2048-bit DH parameters once at startup.
-2. Each connecting client gets those parameters + the server's ephemeral public key.
+1. Server loads RFC 3526 Group 14 DH parameters at startup (instant).
+2. Each client gets those parameters + the server's ephemeral public key.
 3. Client sends its own ephemeral public key back.
-4. Both sides independently derive the **same** 256-bit AES key using HKDF-SHA256.
-5. Every message uses a **fresh random IV** — same plaintext never produces the same ciphertext.
-6. The server decrypts each message (to log it), then re-encrypts it with each recipient's individual key before forwarding.
+4. Both sides independently derive the **same** 256-bit key using HKDF-SHA256.
+5. Every message uses AES-256-GCM: a fresh random 12-byte nonce + a 16-byte authentication tag ensure both **confidentiality and integrity**.
+6. The server decrypts and verifies each message (to log it), then re-encrypts it with each recipient's individual key before forwarding.
+
+---
+
+## Security Notes
+
+### What this protects against
+- **Eavesdropping** — AES-256-GCM encrypts all message content.
+- **Tampering / bit-flipping** — GCM's authentication tag detects any modification in transit; tampered messages raise `InvalidTag` and are dropped.
+- **Key reuse leaking plaintext** — a fresh nonce is generated per message via `os.urandom()`.
+
+### Known limitations (intentional for a learning project)
+- **Not end-to-end encrypted** — this is *client-to-server* + *server-to-client* encryption. The server decrypts every message to log and re-encrypt it. The server is a trusted relay that can read plaintext.
+- **No handshake authentication** — the DH exchange has no signatures or certificates. An active man-in-the-middle who can intercept the TCP stream during the handshake could negotiate separate keys with each side. This is acceptable on a trusted/local network but would require certificate-based or SRP authentication for production use.
 
 ---
 
 ## Dependencies
 
-- [`cryptography`](https://cryptography.io/) — DH, AES, HKDF
+- [`cryptography`](https://cryptography.io/) — DH, AES-GCM, HKDF
 - [`colorama`](https://pypi.org/project/colorama/) — Cross-platform colour terminal output

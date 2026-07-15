@@ -2,36 +2,61 @@
 crypto_utils.py
 ---------------
 Handles all cryptographic operations:
-  - Diffie-Hellman key exchange (2048-bit MODP group)
-  - AES-256-CBC encryption / decryption with random IV per message
-  - PKCS7 padding
+  - Diffie-Hellman key exchange using RFC 3526 Group 14 (2048-bit safe prime)
+  - AES-256-GCM authenticated encryption / decryption (confidentiality + integrity)
+  - HKDF-SHA256 key derivation from DH shared secret
+
+Security notes:
+  - AES-GCM provides both encryption and authentication (AEAD) — no separate HMAC needed.
+  - A fresh random 12-byte nonce is generated per message; reusing a nonce with the
+    same key would be catastrophic, so os.urandom() is used exclusively.
+  - The DH exchange uses precomputed RFC 3526 parameters (instant startup, same security
+    as generating fresh 2048-bit params).
+  - This implementation does NOT authenticate the DH handshake itself (no signatures),
+    so it is vulnerable to an active man-in-the-middle who can intercept the TCP stream.
+    Suitable for a trusted network / learning environment; production use would require
+    certificate-based or SRP authentication of the handshake.
 """
 
 import os
 import json
 import base64
 
-from cryptography.hazmat.primitives.asymmetric.dh import (
-    DHParameterNumbers,
-    DHPublicNumbers,
-    DHPrivateNumbers,
-    generate_parameters,
-)
+from cryptography.hazmat.primitives.asymmetric.dh import DHParameterNumbers
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
 
 # ---------------------------------------------------------------------------
-# Diffie-Hellman helpers
+# RFC 3526 Group 14 — 2048-bit MODP safe prime (precomputed, instant startup)
+# https://www.rfc-editor.org/rfc/rfc3526#section-3
 # ---------------------------------------------------------------------------
+_RFC3526_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF",
+    16,
+)
+_RFC3526_G = 2
 
-def generate_dh_parameters():
-    """Generate 2048-bit DH parameters (done once on the server)."""
-    params = generate_parameters(generator=2, key_size=2048, backend=default_backend())
-    return params
+
+def get_dh_parameters():
+    """
+    Return DH parameters using the RFC 3526 Group 14 safe prime.
+    Instant — no key generation required, same 2048-bit security as generating fresh params.
+    """
+    param_numbers = DHParameterNumbers(_RFC3526_P, _RFC3526_G)
+    return param_numbers.parameters(default_backend())
 
 
 def serialize_dh_parameters(params) -> bytes:
@@ -85,47 +110,48 @@ def derive_shared_key(private_key, peer_public_key) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# AES-256-CBC encryption / decryption
+# AES-256-GCM authenticated encryption / decryption
 # ---------------------------------------------------------------------------
 
 def encrypt_message(key: bytes, plaintext: str) -> str:
     """
-    Encrypt a UTF-8 string with AES-256-CBC.
-    A fresh random 16-byte IV is generated for every message.
-    Returns a Base64-encoded JSON string: {"iv": <b64>, "ct": <b64>}
-    """
-    iv = os.urandom(16)
-    padder = sym_padding.PKCS7(128).padder()
-    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    Encrypt a UTF-8 string with AES-256-GCM (AEAD).
 
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    A fresh random 12-byte nonce is generated for every message.
+    GCM produces a 16-byte authentication tag automatically — any
+    bit-flip or tampering in transit will cause decryption to raise
+    an InvalidTag exception rather than silently returning garbage.
+
+    Returns a JSON string: {"nonce": <b64>, "ct": <b64>}
+    The ciphertext bytes include the GCM auth tag appended by the library.
+    """
+    nonce = os.urandom(12)          # 96-bit nonce — GCM standard recommendation
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
 
     payload = {
-        "iv": base64.b64encode(iv).decode("ascii"),
-        "ct": base64.b64encode(ciphertext).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ct":    base64.b64encode(ciphertext).decode("ascii"),
     }
     return json.dumps(payload)
 
 
 def decrypt_message(key: bytes, token: str) -> str:
     """
-    Decrypt a token produced by encrypt_message().
-    Returns the original plaintext string.
-    Raises ValueError on tampered / malformed data.
+    Decrypt and authenticate a token produced by encrypt_message().
+
+    Raises:
+      - ValueError  : malformed / unparseable token
+      - cryptography.exceptions.InvalidTag : authentication failed (tampered ciphertext)
     """
     try:
         payload = json.loads(token)
-        iv = base64.b64decode(payload["iv"])
+        nonce      = base64.b64decode(payload["nonce"])
         ciphertext = base64.b64decode(payload["ct"])
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         raise ValueError(f"Malformed message token: {exc}") from exc
 
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-
-    unpadder = sym_padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(padded) + unpadder.finalize()
-    return plaintext.decode("utf-8")
+    aesgcm = AESGCM(key)
+    # Will raise InvalidTag if the ciphertext or tag has been modified
+    plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+    return plaintext_bytes.decode("utf-8")

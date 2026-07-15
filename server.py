@@ -3,17 +3,22 @@ server.py
 ---------
 Multi-client encrypted chat server.
 
-Startup sequence per client
+Startup sequence per client:
   1. Send DH parameters (PEM)
   2. Send server's DH public key (PEM)
   3. Receive client's DH public key (PEM)
-  4. Derive shared AES-256 key via HKDF
-  5. Receive client's chosen username (encrypted)
+  4. Derive shared AES-256-GCM key via HKDF-SHA256
+  5. Receive client's chosen username (encrypted + authenticated)
   6. Relay encrypted messages to all other connected clients
 
-All relayed traffic is encrypted end-to-end between each client and the
-server.  The server decrypts each message only to log it, then
-re-encrypts it for every recipient using that recipient's individual key.
+Security model:
+  - Each client-server channel is encrypted and authenticated with AES-256-GCM.
+  - This is client-to-server and server-to-client encryption (NOT end-to-end).
+    The server decrypts each message to log it, then re-encrypts it per recipient.
+    The server is a trusted relay — it can read plaintext messages.
+  - The DH handshake is unauthenticated (no signatures/certificates), so an
+    active man-in-the-middle on the TCP stream could intercept keys. Suitable
+    for a trusted network or learning environment.
 
 Usage:
     python server.py [--host HOST] [--port PORT]
@@ -31,7 +36,7 @@ import colorama
 from colorama import Fore, Style
 
 from crypto_utils import (
-    generate_dh_parameters,
+    get_dh_parameters,
     serialize_dh_parameters,
     generate_dh_keypair,
     serialize_public_key,
@@ -112,7 +117,7 @@ def server_banner() -> None:
     print(Fore.CYAN + "=" * 60)
     print(Fore.CYAN + "       🔒  Encrypted Chat Server  🔒")
     print(Fore.CYAN + "=" * 60)
-    print(Fore.YELLOW + "  AES-256-CBC  |  Diffie-Hellman key exchange")
+    print(Fore.YELLOW + "  AES-256-GCM (AEAD)  |  Diffie-Hellman key exchange")
     print(Fore.YELLOW + f"  Log file : {LOG_FILE.resolve()}")
     print(Fore.CYAN + "=" * 60 + Style.RESET_ALL)
 
@@ -190,9 +195,9 @@ def main() -> None:
 
     server_banner()
 
-    # Generate DH parameters once – reused for all clients
-    print(Fore.YELLOW + "  Generating DH parameters (2048-bit) … ", end="", flush=True)
-    dh_params = generate_dh_parameters()
+    # Use RFC 3526 precomputed DH parameters — instant startup, same 2048-bit security
+    print(Fore.YELLOW + "  Loading RFC 3526 DH parameters (2048-bit) … ", end="", flush=True)
+    dh_params = get_dh_parameters()
     print(Fore.GREEN + "done." + Style.RESET_ALL)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

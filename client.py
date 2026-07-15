@@ -86,7 +86,7 @@ def client_banner() -> None:
     print(Fore.CYAN + "=" * 60)
     print(Fore.CYAN + "       🔒  Encrypted Chat Client  🔒")
     print(Fore.CYAN + "=" * 60)
-    print(Fore.YELLOW + "  AES-256-CBC  |  Diffie-Hellman key exchange")
+    print(Fore.YELLOW + "  AES-256-GCM (AEAD)  |  Diffie-Hellman key exchange")
     print(Fore.CYAN + "=" * 60 + Style.RESET_ALL)
 
 
